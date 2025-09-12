@@ -7,6 +7,9 @@
 (define-constant err-session-not-available (err u105))
 (define-constant err-invalid-status (err u106))
 
+(define-constant err-badge-already-earned (err u107))
+(define-constant err-badge-not-found (err u108))
+
 (define-fungible-token therapy-token)
 
 (define-data-var next-session-id uint u1)
@@ -183,3 +186,93 @@
 
 (define-read-only (get-token-balance (account principal))
   (ft-get-balance therapy-token account))
+
+
+(define-map user-badges principal (list 20 (string-ascii 30)))
+
+(define-map badge-registry (string-ascii 30) {
+  name: (string-ascii 50),
+  description: (string-ascii 100),
+  icon: (string-ascii 20),
+  requirement: uint
+})
+
+(define-data-var next-badge-id uint u1)
+
+(map-set badge-registry "first-session" {
+  name: "First Steps",
+  description: "Completed your first therapy session",
+  icon: "PLANT",
+  requirement: u1
+})
+
+(map-set badge-registry "consistent-client" {
+  name: "Wellness Warrior",
+  description: "Completed 5 therapy sessions",
+  icon: "STAR",
+  requirement: u5
+})
+
+(map-set badge-registry "community-supporter" {
+  name: "Community Champion",
+  description: "Joined the DAO and voted on proposals",
+  icon: "SHIELD",
+  requirement: u1
+})
+
+(define-private (has-badge (user principal) (badge-id (string-ascii 30)))
+  (is-some (index-of (default-to (list) (map-get? user-badges user)) badge-id)))
+
+(define-private (count-completed-sessions (client principal))
+  (let ((session-ids (default-to (list) (map-get? client-sessions client))))
+    (fold check-session-status session-ids u0)))
+
+(define-private (check-session-status (session-id uint) (count uint))
+  (match (map-get? sessions session-id)
+    session-data (if (is-eq (get status session-data) "completed") (+ count u1) count)
+    count))
+
+(define-public (earn-badge (badge-id (string-ascii 30)))
+  (let (
+    (user tx-sender)
+    (badge-data (unwrap! (map-get? badge-registry badge-id) err-badge-not-found))
+    (current-badges (default-to (list) (map-get? user-badges user)))
+    (completed-sessions (count-completed-sessions user))
+    (is-dao-member (is-some (map-get? dao-members user)))
+  )
+    (asserts! (not (has-badge user badge-id)) err-badge-already-earned)
+    (asserts! 
+      (or 
+        (and (is-eq badge-id "first-session") (>= completed-sessions u1))
+        (and (is-eq badge-id "consistent-client") (>= completed-sessions u5))
+        (and (is-eq badge-id "community-supporter") is-dao-member)
+      ) 
+      err-unauthorized)
+    (map-set user-badges user 
+      (unwrap! (as-max-len? (append current-badges badge-id) u20) err-not-found))
+    (ok true)))
+
+(define-read-only (get-user-badges (user principal))
+  (map-get? user-badges user))
+
+(define-read-only (get-badge-info (badge-id (string-ascii 30)))
+  (map-get? badge-registry badge-id))
+
+(define-read-only (check-badge-eligibility (user principal) (badge-id (string-ascii 30)))
+  (let (
+    (completed-sessions (count-completed-sessions user))
+    (is-dao-member (is-some (map-get? dao-members user)))
+    (already-has-badge (has-badge user badge-id))
+  )
+    {
+      eligible: (and 
+        (not already-has-badge)
+        (or 
+          (and (is-eq badge-id "first-session") (>= completed-sessions u1))
+          (and (is-eq badge-id "consistent-client") (>= completed-sessions u5))
+          (and (is-eq badge-id "community-supporter") is-dao-member)
+        )
+      ),
+      already-earned: already-has-badge,
+      sessions-completed: completed-sessions
+    }))
