@@ -10,6 +10,10 @@
 (define-constant err-badge-already-earned (err u107))
 (define-constant err-badge-not-found (err u108))
 
+(define-constant err-already-claimed (err u109))
+(define-constant err-milestone-not-reached (err u110))
+(define-constant err-invalid-referral (err u111))
+
 (define-fungible-token therapy-token)
 
 (define-data-var next-session-id uint u1)
@@ -276,3 +280,76 @@
       already-earned: already-has-badge,
       sessions-completed: completed-sessions
     }))
+
+(define-map wellness-streaks principal {
+  current-streak: uint,
+  longest-streak: uint,
+  last-session-block: uint,
+  milestones-claimed: (list 10 uint)
+})
+
+(define-map referrals principal {
+  referrer: principal,
+  referral-count: uint,
+  total-rewards: uint
+})
+
+(define-private (calculate-streak (client principal))
+  (let (
+    (streak-data (default-to { current-streak: u0, longest-streak: u0, last-session-block: u0, milestones-claimed: (list) } 
+      (map-get? wellness-streaks client)))
+    (session-count (count-completed-sessions client))
+  )
+    (merge streak-data { current-streak: session-count })))
+
+(define-private (milestone-reward-amount (milestone uint))
+  (if (is-eq milestone u3) u50
+    (if (is-eq milestone u7) u150
+      (if (is-eq milestone u14) u350 u0))))
+
+(define-public (claim-wellness-milestone (milestone uint))
+  (let (
+    (streak-data (calculate-streak tx-sender))
+    (current-streak (get current-streak streak-data))
+    (claimed-list (get milestones-claimed streak-data))
+    (reward (milestone-reward-amount milestone))
+  )
+    (asserts! (>= current-streak milestone) err-milestone-not-reached)
+    (asserts! (is-none (index-of claimed-list milestone)) err-already-claimed)
+    (asserts! (> reward u0) err-invalid-status)
+    (map-set wellness-streaks tx-sender 
+      (merge streak-data { milestones-claimed: (unwrap! (as-max-len? (append claimed-list milestone) u10) err-not-found) }))
+    (as-contract (ft-mint? therapy-token reward tx-sender))))
+
+(define-public (register-referral (referrer principal))
+  (let ((existing-referral (map-get? referrals tx-sender)))
+    (asserts! (is-none existing-referral) err-already-exists)
+    (asserts! (not (is-eq referrer tx-sender)) err-invalid-referral)
+    (map-set referrals tx-sender { referrer: referrer, referral-count: u0, total-rewards: u0 })
+    (ok true)))
+
+(define-public (process-referral-reward (new-client principal))
+  (let (
+    (referral-data (unwrap! (map-get? referrals new-client) err-not-found))
+    (referrer (get referrer referral-data))
+    (referrer-stats (default-to { referrer: tx-sender, referral-count: u0, total-rewards: u0 } (map-get? referrals referrer)))
+    (completed (count-completed-sessions new-client))
+  )
+    (asserts! (is-eq (get referral-count referral-data) u0) err-already-claimed)
+    (asserts! (>= completed u1) err-milestone-not-reached)
+    (map-set referrals referrer 
+      (merge referrer-stats { 
+        referral-count: (+ (get referral-count referrer-stats) u1),
+        total-rewards: (+ (get total-rewards referrer-stats) u100)
+      }))
+    (map-set referrals new-client (merge referral-data { referral-count: u1 }))
+    (as-contract (ft-mint? therapy-token u100 referrer))))
+
+(define-read-only (get-wellness-streak (client principal))
+  (let ((streak-data (calculate-streak client)))
+    { current-streak: (get current-streak streak-data),
+      longest-streak: (get longest-streak streak-data),
+      milestones-claimed: (get milestones-claimed streak-data) }))
+
+(define-read-only (get-referral-stats (user principal))
+  (map-get? referrals user))
