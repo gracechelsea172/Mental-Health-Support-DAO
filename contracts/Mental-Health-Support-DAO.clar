@@ -14,6 +14,14 @@
 (define-constant err-milestone-not-reached (err u110))
 (define-constant err-invalid-referral (err u111))
 
+
+(define-constant err-not-emergency-counselor (err u112))
+(define-constant err-emergency-limit-reached (err u113))
+(define-constant err-subsidy-depleted (err u114))
+
+(define-data-var emergency-subsidy-pool uint u50000)
+(define-data-var emergency-sessions-today uint u0)
+
 (define-fungible-token therapy-token)
 
 (define-data-var next-session-id uint u1)
@@ -353,3 +361,76 @@
 
 (define-read-only (get-referral-stats (user principal))
   (map-get? referrals user))
+
+
+(define-map emergency-counselors principal {
+  available: bool,
+  emergency-rate: uint,
+  max-daily-emergency: uint,
+  total-emergency-sessions: uint,
+  current-daily-count: uint,
+  last-reset-block: uint
+})
+
+(define-private (reset-daily-count-if-needed (counselor principal) (counselor-data {available: bool, emergency-rate: uint, max-daily-emergency: uint, total-emergency-sessions: uint, current-daily-count: uint, last-reset-block: uint}))
+  (if (>= (- stacks-block-height (get last-reset-block counselor-data)) u144)
+    (merge counselor-data {current-daily-count: u0, last-reset-block: stacks-block-height})
+    counselor-data))
+
+(define-public (enable-emergency-sessions (emergency-rate uint) (max-daily uint))
+  (let ((counselor-info (unwrap! (map-get? counselors tx-sender) err-not-found)))
+    (asserts! (get is-active counselor-info) err-unauthorized)
+    (asserts! (>= emergency-rate (* (get rate-per-session counselor-info) u2)) err-invalid-status)
+    (map-set emergency-counselors tx-sender {
+      available: true,
+      emergency-rate: emergency-rate,
+      max-daily-emergency: max-daily,
+      total-emergency-sessions: u0,
+      current-daily-count: u0,
+      last-reset-block: stacks-block-height
+    })
+    (ok true)))
+
+(define-public (book-emergency-session (counselor principal) (duration uint))
+  (let (
+    (session-id (var-get next-session-id))
+    (emergency-data-raw (unwrap! (map-get? emergency-counselors counselor) err-not-emergency-counselor))
+    (emergency-data (reset-daily-count-if-needed counselor emergency-data-raw))
+    (full-cost (* (get emergency-rate emergency-data) duration))
+    (subsidy (/ full-cost u2))
+    (client-cost (- full-cost subsidy))
+    (client-balance (ft-get-balance therapy-token tx-sender))
+    (current-pool (var-get emergency-subsidy-pool))
+  )
+    (asserts! (get available emergency-data) err-not-emergency-counselor)
+    (asserts! (< (get current-daily-count emergency-data) (get max-daily-emergency emergency-data)) err-emergency-limit-reached)
+    (asserts! (>= current-pool subsidy) err-subsidy-depleted)
+    (asserts! (>= client-balance client-cost) err-insufficient-funds)
+    (try! (ft-transfer? therapy-token client-cost tx-sender (as-contract tx-sender)))
+    (var-set emergency-subsidy-pool (- current-pool subsidy))
+    (map-set sessions session-id {
+      client: tx-sender,
+      counselor: counselor,
+      session-date: stacks-block-height,
+      duration: duration,
+      cost: full-cost,
+      status: "emergency",
+      created-at: stacks-block-height
+    })
+    (var-set next-session-id (+ session-id u1))
+    (map-set emergency-counselors counselor 
+      (merge emergency-data {
+        current-daily-count: (+ (get current-daily-count emergency-data) u1),
+        total-emergency-sessions: (+ (get total-emergency-sessions emergency-data) u1)
+      }))
+    (let ((current-sessions (default-to (list) (map-get? client-sessions tx-sender))))
+      (map-set client-sessions tx-sender (unwrap! (as-max-len? (append current-sessions session-id) u50) err-not-found)))
+    (ok session-id)))
+
+(define-read-only (get-emergency-counselor (counselor principal))
+  (match (map-get? emergency-counselors counselor)
+    data (some (reset-daily-count-if-needed counselor data))
+    none))
+
+(define-read-only (get-emergency-subsidy-balance)
+  (var-get emergency-subsidy-pool))
